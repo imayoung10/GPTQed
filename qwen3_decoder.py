@@ -35,32 +35,25 @@ def get_qwen3(model_name):
 
 @torch.no_grad()
 def qwen3ASR_sequential(model, dataloader, dev):
-    print('Starting ...')
-    
+    print("Starting ...")
+
     decoder = model.model.thinker.model
     layers = decoder.layers
     config = decoder.config
-    
+
     use_cache = getattr(config, "use_cache", False)
     if hasattr(config, "use_cache"):
         config.use_cache = False
-        
-    decoder.embed_tokens = decoder.embed_tokens.to(dev)
-    decoder.norm = decoder.norm.to(dev)
-    layers[0] = layers[0].to(dev)
 
-    dtype = next(iter(model.parameters())).dtype
-    hidden_size = decoder.config.hidden_size
-    inps = torch.zeros(
-        (args.nsamples, model.seqlen, hidden_size),
-        dtype=dtype,
-        device=dev,
-    )
-    cache = {"i": 0, "attention_mask": None, "position_ids": None}
+    decoder.embed_tokens = decoder.embed_tokens.to(dev)
+    if decoder.norm is not None:
+        decoder.norm = decoder.norm.to(dev)
+    layers[0] = layers[0].to(dev)
 
     inps = []
     attn_masks = []
     pos_ids = []
+    cache = {"i": 0}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -68,35 +61,35 @@ def qwen3ASR_sequential(model, dataloader, dev):
             self.module = module
 
         def forward(self, inp, **kwargs):
+            # inp shape: (1, seq_len, hidden_size)
             inps.append(inp.detach())
             attn_masks.append(kwargs.get("attention_mask", None))
             pos_ids.append(kwargs.get("position_ids", None))
             cache["i"] += 1
             raise ValueError
-        
+
     layers[0] = Catcher(layers[0])
-    
+
     for batch in dataloader:
         try:
             model(batch)
         except ValueError:
             pass
-        if cache["i"] >= args.nsamples:  # 추가
+        if cache["i"] >= args.nsamples:
             break
 
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
     decoder.embed_tokens = decoder.embed_tokens.cpu()
-    decoder.norm = decoder.norm.cpu()
+    if decoder.norm is not None:
+        decoder.norm = decoder.norm.cpu()
     torch.cuda.empty_cache()
-    
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
 
-    print('Ready.')
+    print(f"Captured {len(inps)} samples")
+    print("Ready.")
 
     quantizers = {}
+
     for i in range(len(layers)):
         layer = layers[i].to(dev)
         full = find_layers(layer)
@@ -110,7 +103,7 @@ def qwen3ASR_sequential(model, dataloader, dev):
             ]
         else:
             sequential = [list(full.keys())]
-       
+
         for names in sequential:
             subset = {n: full[n] for n in names}
 
@@ -126,48 +119,57 @@ def qwen3ASR_sequential(model, dataloader, dev):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
                 return tmp
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-                
-            for j in range(args.nsamples):
+
+            handles = [subset[name].register_forward_hook(add_batch(name)) for name in subset]
+
+            # calibration pass for this subset
+            outs = []
+            for j in range(len(inps)):
                 kwargs = {}
-                if attention_mask is not None:
-                    kwargs["attention_mask"] = attention_mask
-                if position_ids is not None:
-                    kwargs["position_ids"] = position_ids
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-            
-            
+                if attn_masks[j] is not None:
+                    kwargs["attention_mask"] = attn_masks[j]
+                if pos_ids[j] is not None:
+                    kwargs["position_ids"] = pos_ids[j]
+
+                out = layer(inps[j], **kwargs)[0]
+                outs.append(out.detach())
+
             for h in handles:
                 h.remove()
 
             for name in subset:
                 print(i, name)
-                print('Quantizing ...')
+                print("Quantizing ...")
                 gptq[name].fasterquant(
-                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
+                    percdamp=args.percdamp,
+                    groupsize=args.groupsize,
+                    actorder=args.act_order,
+                    static_groups=args.static_groups
                 )
                 quantizers[f"model.thinker.model.layers.{i}.{name}"] = gptq[name].quantizer
                 gptq[name].free()
 
-        for j in range(args.nsamples):
+        # run quantized layer again to produce next layer inputs
+        new_inps = []
+        for j in range(len(inps)):
             kwargs = {}
-            if attention_mask is not None:
-                kwargs["attention_mask"] = attention_mask
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
-            outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+            if attn_masks[j] is not None:
+                kwargs["attention_mask"] = attn_masks[j]
+            if pos_ids[j] is not None:
+                kwargs["position_ids"] = pos_ids[j]
+
+            out = layer(inps[j], **kwargs)[0]
+            new_inps.append(out.detach())
 
         layers[i] = layer.cpu()
         del layer
-        del gptq 
         torch.cuda.empty_cache()
-        inps, outs = outs, inps
+
+        inps = new_inps
 
     if hasattr(config, "use_cache"):
         config.use_cache = use_cache
-    
+
     return quantizers
 
 @torch.no_grad()
