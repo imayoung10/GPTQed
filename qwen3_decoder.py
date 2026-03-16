@@ -190,10 +190,13 @@ def qwen3ASR_eval(model, splits, dev, batch_size=8):
         samples = load_librispeech_samples(split_name)
 
         print(f"  Running inference (batch_size={batch_size}) ...")
-        result = evaluate_split(model, samples, wer_metric, batch_size, dev)
+        result = evaluate_split_with_perf(model, samples, wer_metric, batch_size, dev)
 
-        print(f'WER ={result["wer"] * 100:.2f}%')
-    
+        print(f"WER              = {result['wer'] * 100:.2f}%")
+        print(f"Avg batch latency= {result['avg_batch_latency_sec']:.3f} s")
+        print(f"RTF              = {result['rtf']:.4f}")
+        if result["peak_vram_mb"] is not None:
+            print(f"Peak VRAM        = {result['peak_vram_mb']:.1f} MB")
 
     if hasattr(config, "use_cache"):
         config.use_cache = use_cache

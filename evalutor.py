@@ -239,3 +239,89 @@ def _save_results(output: Dict[str, Any], save_path: str):
         json.dump(serializable, f, indent=2, ensure_ascii=False)
 
     print(f"\nResults saved → {save_path}")
+    
+import time
+import torch
+
+def evaluate_split_with_perf(
+    model,
+    samples,
+    wer_metric,
+    batch_size: int,
+    dev: str,
+):
+    predictions = []
+    references = []
+    records = []
+
+    total_infer_time = 0.0
+    total_audio_sec = 0.0
+    batch_latencies = []
+
+    use_cuda = str(dev).startswith("cuda") and torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(dev)
+        torch.cuda.synchronize(dev)
+
+    for batch in batchify(samples, batch_size):
+        batch_audio = [x["audio_array"] for x in batch]
+        batch_refs = [x["reference"] for x in batch]
+
+        # audio duration accumulation
+        batch_audio_sec = sum(len(x["audio_array"]) / x["sampling_rate"] for x in batch)
+        total_audio_sec += batch_audio_sec
+
+        if use_cuda:
+            torch.cuda.synchronize(dev)
+        start = time.perf_counter()
+
+        results = model.transcribe(
+            audio=batch_audio,
+            context="",
+            return_time_stamps=False,
+        )
+
+        if use_cuda:
+            torch.cuda.synchronize(dev)
+        elapsed = time.perf_counter() - start
+
+        total_infer_time += elapsed
+        batch_latencies.append(elapsed)
+
+        for sample, result, ref in zip(batch, results, batch_refs):
+            pred_raw = result.text
+            ref_raw = ref
+            pred_norm = normalize_text(pred_raw)
+            ref_norm = normalize_text(ref_raw)
+
+            predictions.append(pred_norm)
+            references.append(ref_norm)
+
+            records.append({
+                "id": sample["id"],
+                "language_pred": result.language,
+                "prediction_raw": pred_raw,
+                "reference_raw": ref_raw,
+                "prediction_norm": pred_norm,
+                "reference_norm": ref_norm,
+            })
+
+    wer = wer_metric.compute(predictions=predictions, references=references)
+
+    peak_vram_mb = None
+    if use_cuda:
+        peak_vram_mb = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
+
+    avg_latency_sec = total_infer_time / max(len(batch_latencies), 1)
+    avg_rtf = total_infer_time / max(total_audio_sec, 1e-8)
+
+    return {
+        "wer": wer,
+        "records": records,
+        "total_infer_time_sec": total_infer_time,
+        "total_audio_sec": total_audio_sec,
+        "avg_batch_latency_sec": avg_latency_sec,
+        "rtf": avg_rtf,
+        "peak_vram_mb": peak_vram_mb,
+    }
