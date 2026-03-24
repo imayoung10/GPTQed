@@ -16,7 +16,8 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = "meta-llama/Llama-2-7b-hf"
+    model = LlamaForCausalLM.from_pretrained(model, token="", torch_dtype='auto')
     model.seqlen = 2048
     return model
 
@@ -70,6 +71,7 @@ def llama_sequential(model, dataloader, dev):
     quantizers = {}
     for i in range(len(layers)):
         layer = layers[i].to(dev)
+        ## full : 한 블럭의 layer 전체 (아마 모듈 반환 하겠지?)
         full = find_layers(layer)
 
         if args.true_sequential:
@@ -84,7 +86,13 @@ def llama_sequential(model, dataloader, dev):
        
         for names in sequential:
             subset = {n: full[n] for n in names}
+            """
+            subset = {'linear layer name' : linear layer module}
+            예시
+            subset = {'self_attn.k_proj' : full['self_attn.k_proj'], }
+            """
 
+            ### gptq {key : linear layer name, value : GPTQ(module)}
             gptq = {}
             for name in subset:
                 gptq[name] = GPTQ(subset[name])
@@ -113,7 +121,7 @@ def llama_sequential(model, dataloader, dev):
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
-
+        ## dequant 후 weight
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
 
@@ -193,7 +201,12 @@ def llama_eval(model, testenc, dev):
                 ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(
+                            inps[j].unsqueeze(0),
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            position_embeddings=model.model.rotary_emb(inps[j].unsqueeze(0), position_ids)
+                        )[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

@@ -22,10 +22,12 @@ caliset_builder.py
 
 import json
 import random
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-from datasets import load_dataset
+from datasets import Audio, load_dataset
 
 
 # 16kHz로 통일
@@ -53,6 +55,108 @@ def get_duration(audio: np.ndarray, sr: int = TARGET_SR) -> float:
     return len(audio) / sr
 
 
+def _audio_path_or_bytes(audio_field: dict) -> tuple[str | None, bytes | None]:
+    """Audio(decode=False) entry에서 path/bytes를 안전하게 추출."""
+    if not isinstance(audio_field, dict):
+        return None, None
+    return audio_field.get("path"), audio_field.get("bytes")
+
+
+@lru_cache(maxsize=4096)
+def _search_in_hf_cache(filename: str) -> str | None:
+    """HF 캐시 하위에서 basename으로 실제 파일 경로를 탐색."""
+    home = Path.home()
+    roots = [
+        home / ".cache" / "huggingface" / "datasets",
+        home / ".cache" / "huggingface" / "hub",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob(filename):
+                if p.is_file():
+                    return str(p)
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_audio_path(path: str | None, sample: dict | None = None) -> str | None:
+    """상대경로/축약경로를 실제 파일 경로로 해석."""
+    candidates: list[str] = []
+    if path:
+        candidates.append(path)
+    if sample is not None:
+        file_field = sample.get("file")
+        if isinstance(file_field, str) and file_field:
+            candidates.append(file_field)
+
+    for cand in candidates:
+        p = Path(cand)
+        if p.is_file():
+            return str(p)
+        if not p.is_absolute():
+            abs_p = (Path.cwd() / p).resolve()
+            if abs_p.is_file():
+                return str(abs_p)
+            found = _search_in_hf_cache(p.name)
+            if found is not None:
+                return found
+
+    return None
+
+
+def get_audio_duration_fast(audio_field: dict, sample: dict | None = None) -> float:
+    """헤더 정보만 읽어 duration 계산 (전체 split 스캔용)."""
+    path, audio_bytes = _audio_path_or_bytes(audio_field)
+    resolved_path = _resolve_audio_path(path, sample)
+
+    if resolved_path:
+        try:
+            import torchaudio
+            info = torchaudio.info(resolved_path)
+            return float(info.num_frames) / float(info.sample_rate)
+        except Exception:
+            import soundfile as sf
+            info = sf.info(resolved_path)
+            return float(info.frames) / float(info.samplerate)
+
+    if audio_bytes is not None:
+        import soundfile as sf
+        info = sf.info(BytesIO(audio_bytes))
+        return float(info.frames) / float(info.samplerate)
+
+    raise RuntimeError(f"audio path/bytes unavailable: path={path!r}")
+
+
+def load_audio_array(audio_field: dict, sample: dict | None = None) -> tuple[np.ndarray, int]:
+    """Audio(decode=False) entry에서 waveform(np.float32, mono) + sr 로드."""
+    path, audio_bytes = _audio_path_or_bytes(audio_field)
+    resolved_path = _resolve_audio_path(path, sample)
+
+    if resolved_path:
+        try:
+            import torchaudio
+            wav, sr = torchaudio.load(resolved_path)
+            if wav.ndim == 2 and wav.size(0) > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            return wav.squeeze(0).numpy().astype(np.float32), int(sr)
+        except Exception:
+            import soundfile as sf
+            wav, sr = sf.read(resolved_path, dtype="float32", always_2d=True)
+            wav = wav.mean(axis=1)
+            return wav.astype(np.float32), int(sr)
+
+    if audio_bytes is not None:
+        import soundfile as sf
+        wav, sr = sf.read(BytesIO(audio_bytes), dtype="float32", always_2d=True)
+        wav = wav.mean(axis=1)
+        return wav.astype(np.float32), int(sr)
+
+    raise RuntimeError(f"audio path/bytes unavailable: path={path!r}")
+
+
 # ──────────────────────────────────────────────
 # 샘플링
 # ──────────────────────────────────────────────
@@ -66,46 +170,54 @@ def sample_from_split(split: str, n: int, seed: int) -> list[dict]:
     ds = load_dataset(
         "openslr/librispeech_asr",
         split=split,
-        trust_remote_code=True,
     )
+    ds = ds.cast_column("audio", Audio(decode=False))
 
-    # duration 계산 후 버킷 분류
+    # duration 버킷별 quota
     rng = random.Random(seed)
-    buckets: dict[str, list[int]] = {"short": [], "medium": [], "long": []}
-
-    for idx, sample in enumerate(ds):
-        dur = len(sample["audio"]["array"]) / sample["audio"]["sampling_rate"]
-        if dur < 3.0:
-            buckets["short"].append(idx)
-        elif dur < 8.0:
-            buckets["medium"].append(idx)
-        else:
-            buckets["long"].append(idx)
-
     per_bucket = n // 3
     counts = {
         "short":  per_bucket,
         "medium": per_bucket,
         "long":   n - 2 * per_bucket,   # 나머지 long에 배정
     }
+    selected_counts = {"short": 0, "medium": 0, "long": 0}
 
-    selected_indices = []
-    for bname, cnt in counts.items():
-        pool = buckets[bname]
-        rng.shuffle(pool)
-        selected_indices.extend(pool[:cnt])
+    indices = list(range(len(ds)))
+    rng.shuffle(indices)
 
-    # 인덱스 순서 섞기
-    rng.shuffle(selected_indices)
+    selected_indices: list[int] = []
+    for idx in indices:
+        if len(selected_indices) >= n:
+            break
+        sample = ds[idx]
+        dur = get_audio_duration_fast(sample["audio"], sample=sample)
+        if dur < 3.0:
+            bname = "short"
+        elif dur < 8.0:
+            bname = "medium"
+        else:
+            bname = "long"
+
+        if selected_counts[bname] < counts[bname]:
+            selected_indices.append(idx)
+            selected_counts[bname] += 1
+
+    if len(selected_indices) < n:
+        selected_set = set(selected_indices)
+        for idx in indices:
+            if idx in selected_set:
+                continue
+            selected_indices.append(idx)
+            if len(selected_indices) >= n:
+                break
 
     # 레코드 생성
     records = []
     for _, idx in enumerate(selected_indices):
         sample = ds[idx]
-        audio, sr = resample_if_needed(
-            np.array(sample["audio"]["array"], dtype=np.float32),
-            sample["audio"]["sampling_rate"],
-        )
+        raw_audio, raw_sr = load_audio_array(sample["audio"], sample=sample)
+        audio, sr = resample_if_needed(raw_audio, raw_sr)
         dur = get_duration(audio, sr)
 
         records.append({
@@ -119,7 +231,7 @@ def sample_from_split(split: str, n: int, seed: int) -> list[dict]:
         })
 
     print(f"    {split}: {len(records)} samples  "
-          f"(short={counts['short']}, medium={counts['medium']}, long={counts['long']})")
+          f"(short={selected_counts['short']}, medium={selected_counts['medium']}, long={selected_counts['long']})")
     return records
 
 
@@ -198,5 +310,3 @@ def build(n_per_split: int = 64,
     save_metadata(all_records, out_dir)
 
     return all_records
-
-

@@ -4,10 +4,11 @@ from typing import List, Dict, Any
 
 import torch
 import evaluate as evaluate_lib
-from datasets import load_dataset, concatenate_datasets
+from datasets import Audio, load_dataset, concatenate_datasets
 from whisper.normalizers import EnglishTextNormalizer
 
 from qwen_asr import Qwen3ASRModel
+from caliset_builder import load_audio_array
 
 
 
@@ -65,15 +66,16 @@ def load_librispeech_samples(split_name: str) -> List[Dict[str, Any]]:
     ds = load_dataset(
         "openslr/librispeech_asr",
         split=hf_split,
-        trust_remote_code=True,
     )
+    ds = ds.cast_column("audio", Audio(decode=False))
 
     samples = []
     for i, row in enumerate(ds):
+        audio_array, sr = load_audio_array(row["audio"], sample=row)
         samples.append({
             "id":            str(row.get("id", i)),
-            "audio_array":   row["audio"]["array"],
-            "sampling_rate": row["audio"]["sampling_rate"],
+            "audio_array":   audio_array,
+            "sampling_rate": sr,
             "reference":     row["text"],
         })
 
@@ -113,8 +115,8 @@ def evaluate_split(
     records     = []
 
     for batch in batchify(samples, batch_size):
-        # Qwen3ASRModel.transcribe는 numpy array 또는 파일 경로 둘 다 지원
-        batch_audio = [x["audio_array"] for x in batch]
+        # qwen_asr normalize_audio_input: (np.ndarray, sr) 또는 path(str) 지원
+        batch_audio = [(x["audio_array"], x["sampling_rate"]) for x in batch]
         batch_refs  = [x["reference"]   for x in batch]
 
         results = model.transcribe(
@@ -265,7 +267,7 @@ def evaluate_split_with_perf(
         torch.cuda.synchronize(dev)
 
     for batch in batchify(samples, batch_size):
-        batch_audio = [x["audio_array"] for x in batch]
+        batch_audio = [(x["audio_array"], x["sampling_rate"]) for x in batch]
         batch_refs = [x["reference"] for x in batch]
 
         # audio duration accumulation

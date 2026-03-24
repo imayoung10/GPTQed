@@ -12,7 +12,13 @@ from evalutor import *
 from evalutor import *
 import evaluate as evaluate_lib
 from hy_datautils import build_cali_dataloader
+from caliset_builder import TARGET_SR
 DEV = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _get_core_model(model):
+    """Qwen3ASRModel wrapper / HF core model 모두 지원."""
+    return model.model if hasattr(model, "model") else model
 
 def get_qwen3(model_name):
     import torch
@@ -37,7 +43,8 @@ def get_qwen3(model_name):
 def qwen3ASR_sequential(model, dataloader, dev):
     print("Starting ...")
 
-    decoder = model.model.thinker.model
+    core_model = _get_core_model(model)
+    decoder = core_model.thinker.model
     layers = decoder.layers
     config = decoder.config
 
@@ -72,7 +79,14 @@ def qwen3ASR_sequential(model, dataloader, dev):
 
     for batch in dataloader:
         try:
-            model(batch)
+            if hasattr(model, "transcribe"):
+                model.transcribe(
+                    audio=[(wav, TARGET_SR) for wav in batch],
+                    context="",
+                    return_time_stamps=False,
+                )
+            else:
+                model(batch)
         except ValueError:
             pass
         if cache["i"] >= args.nsamples:
@@ -176,7 +190,8 @@ def qwen3ASR_sequential(model, dataloader, dev):
 def qwen3ASR_eval(model, splits, dev, batch_size=8):
     print('Evaluating ...')
 
-    decoder = model.model.thinker.model
+    core_model = _get_core_model(model)
+    decoder = core_model.thinker.model
     config = decoder.config
     
     use_cache = getattr(config, "use_cache", False)
@@ -236,7 +251,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     model = get_qwen3(args.model)
-    model.eval()
+    core_model = _get_core_model(model).to(DEV)
+    core_model.eval()
+    if hasattr(model, "model"):
+        model.model = core_model
+    else:
+        model = core_model
 
     dataloader = build_cali_dataloader(
             n_per_split=64,       # 총 128개
@@ -249,4 +269,4 @@ if __name__ == '__main__':
         print(time.time() - tick)
 
     splits = ["test-clean", "test-other"]
-    qwen3ASR_eval(model, splits, DEV)
+    qwen3ASR_eval(model, splits, DEV, batch_size=args.batch_size)

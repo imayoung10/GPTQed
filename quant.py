@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
+## 사실은 fake_quantize 가 맞다
 def quantize(x, scale, zero, maxq):
     if maxq < 0:
         return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
@@ -32,7 +32,8 @@ class Quantizer(nn.Module):
         self.maxshrink = maxshrink 
         if trits:
             self.maxq = torch.tensor(-1) 
-
+    
+    ## quantization parmas 구함
     def find_params(self, x, weight=False):
         dev = x.device
         self.maxq = self.maxq.to(dev)

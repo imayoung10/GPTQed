@@ -69,6 +69,17 @@ class GPTQ:
 
         tick = time.time()
 
+        """
+        Python 특징 
+        initialize를 dictionary 형식으로 해서, 처음 정의할때 없었던 속성도 나중에 추가 가능.
+        
+        덜 헷갈리게 하는법
+        def __init__(self):
+            self.quantizer = None 으로 미리 정의
+        추가할때 구현 안됐으면 에러 발생
+        if self.quantizer is None:
+            raise ValueError("quantizer is not set")
+        """
         if not self.quantizer.ready():
             self.quantizer.find_params(W, weight=True)
 
