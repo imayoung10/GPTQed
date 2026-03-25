@@ -1,0 +1,7 @@
+{
+  "from_libri": true,
+  "dataset_name": "openslr/librispeech_asr",
+  "config_name": null,
+  "split": "train.clean.100",
+  "caliset_name": "librispeech_basic",
+  "hf_indices": 

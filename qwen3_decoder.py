@@ -1,4 +1,5 @@
 import time
+from typing_extensions import LiteralString
 
 import torch
 import torch.nn as nn
@@ -11,8 +12,8 @@ from evalutor import *
 
 from evalutor import *
 import evaluate as evaluate_lib
-from hy_datautils import build_cali_dataloader
-from caliset_builder import TARGET_SR
+from hy_caliset.caliset_builder import *
+from hy_caliset.dataloader_builder import *
 DEV = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
@@ -81,12 +82,13 @@ def qwen3ASR_sequential(model, dataloader, dev):
         try:
             if hasattr(model, "transcribe"):
                 model.transcribe(
-                    audio=[(wav, TARGET_SR) for wav in batch],
-                    context="",
+                    audio=batch[0]["audio"],
+                    context=batch[0]["text"],
+                    language=batch[0]["cv_lang"],
                     return_time_stamps=False,
                 )
             else:
-                model(batch)
+                model(batch[0])
         except ValueError:
             pass
         if cache["i"] >= args.nsamples:
